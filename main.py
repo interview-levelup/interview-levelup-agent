@@ -38,6 +38,7 @@ class ChatResponse(BaseModel):
     evaluation_detail: Optional[str] = None
     finished: bool = False
     aborted: bool = False                 # True when LLM terminates interview early
+    is_sub: bool = False                  # True when candidate directed a sub-question at the interviewer
     is_followup: bool = False
     current_round: int = 0
     followup_count: int = 0

@@ -176,16 +176,23 @@ def decide_next_step_node(state: InterviewState) -> dict:
     ]
     recent_answers = (past_answers + [state.candidate_answer or ""])[-3:]
 
-    if len(recent_answers) >= 2:
+    if len(recent_answers) >= 3:
         answers_block = "\n".join(f"- {a}" for a in recent_answers)
         abort_prompt = (
             "You are judging candidate engagement in a job interview.\n"
             "Here are the candidate's most recent answers:\n"
             f"{answers_block}\n\n"
-            "If the candidate is clearly disengaged — e.g. giving insults, single dismissive "
-            "words, random characters, or repeatedly refusing to answer — respond with "
-            "exactly: ABORT\n"
-            "Otherwise respond with exactly: CONTINUE"
+            "Respond with ABORT only if the candidate is being actively hostile or abusive — "
+            "for example: sending insults or profanity directed at the interviewer, "
+            "deliberate gibberish / keyboard-mashing with clear bad intent, or explicit "
+            "refusals combined with hostility (e.g. '滚', 'f*** this', '垃圾面试').\n\n"
+            "Do NOT respond with ABORT for any of these — they are just weak performance:\n"
+            "  - Saying they don't know ('我不会', '不知道', 'I don't know', '不清楚')\n"
+            "  - Asking to skip or move on ('下一题', 'pass', '跳过', 'next question')\n"
+            "  - Giving short or incomplete answers\n"
+            "  - Staying silent or giving a blank response\n"
+            "  - Admitting confusion or uncertainty\n\n"
+            "Respond with exactly: ABORT or CONTINUE"
         )
         abort_resp = llm.invoke(
             [{"role": "user", "content": abort_prompt}],
@@ -296,11 +303,84 @@ def generate_report_node(state: InterviewState) -> dict:
 
 # ── Routing functions ──────────────────────────────────────────────────────────
 
-def route_entry(state: InterviewState) -> Literal["evaluate_answer", "generate_question"]:
+def check_sub_node(state: InterviewState) -> dict:
+    """
+    Detect whether the candidate is directing a sub-question back at the interviewer
+    rather than actually answering the question.
+
+    Sub-interactions include (but are not limited to):
+    - Asking for clarification or rephrasing ("could you explain?", "能说细点吗")
+    - Asking for an example ("could you give an example?")
+    - Asking for more context about the scenario ("what's the tech stack?")
+    - Pushing back on the question ("that seems too broad, could you narrow it?")
+    - Any reply that is a question directed at the interviewer rather than an attempt to answer
+    """
+    prompt = (
+        "You are an interviewer in a job interview.\n"
+        f"You asked: {state.current_question}\n"
+        f"The candidate replied: {state.candidate_answer}\n\n"
+        "Classify the candidate's reply as SUB or ANSWER using these strict rules:\n\n"
+        "SUB — the candidate is asking the INTERVIEWER something, for example:\n"
+        "  '能举个例子吗', '你的意思是…?', 'could you give an example?', "
+        "'what do you mean by X?', 'can you rephrase?', 'what tech stack should I assume?'\n"
+        "  A SUB reply is a genuine QUESTION or REQUEST directed at the interviewer.\n\n"
+        "ANSWER — everything else, including:\n"
+        "  - Weak or partial answers ('我不确定', 'I think maybe…')\n"
+        "  - Admissions of not knowing ('我不清楚', '不知道', 'I don't know', '不太了解')\n"
+        "  - Requests to skip or move on ('下一题吧', '跳过', 'skip this', 'next question please', "
+        "'换一个问题', '我想跳过')\n"
+        "  - Giving up or refusing ('算了', 'pass', '不想答')\n"
+        "  Even if the candidate cannot answer, that is still an ANSWER, not a SUB.\n\n"
+        "Respond with exactly one word: SUB or ANSWER"
+    )
+    resp = llm.invoke(
+        [{"role": "user", "content": prompt}],
+        max_tokens=10,
+        temperature=0.0,
+    )
+    text = (resp.content.strip() if hasattr(resp, "content") else str(resp).strip()).upper()
+    if "SUB" in text:
+        return {"interview_stage": "sub"}
+    return {"interview_stage": "evaluating"}
+
+
+def handle_sub_node(state: InterviewState) -> dict:
+    """
+    Respond to the candidate's sub-question / request directed back at the interviewer.
+    This could be a request for clarification, an example, more context, a rephrasing,
+    or any other interviewer-directed inquiry. Respond helpfully and stay on the same topic.
+    """
+    prompt = (
+        "You are an interviewer conducting a job interview. "
+        "The candidate has responded to your question not with an answer, "
+        "but with a question or request directed back at you.\n"
+        f"Your original question: {state.current_question}\n"
+        f"Candidate's message: {state.candidate_answer}\n\n"
+        "Address the candidate's request helpfully — clarify, give an example, provide context, "
+        "or rephrase as appropriate. Do NOT move to a new topic. "
+        "End your response with the question restated (or refined) so the candidate knows what to answer.\n"
+        f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
+    )
+    resp = llm.invoke(
+        [{"role": "user", "content": prompt}],
+        max_tokens=200,
+        temperature=0.5,
+    )
+    response_text = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
+    return {"current_question": response_text}
+
+
+def route_entry(state: InterviewState) -> str:
     """No answer → start of interview, generate first question directly."""
     if state.candidate_answer is not None:
-        return "evaluate_answer"
+        return "check_sub"
     return "generate_question"
+
+
+def route_after_check(state: InterviewState) -> str:
+    if state.interview_stage == "sub":
+        return "handle_sub"
+    return "evaluate_answer"
 
 
 def route_after_decide(
@@ -319,6 +399,8 @@ def route_after_decide(
 workflow = StateGraph(InterviewState)
 
 workflow.add_node("generate_question", generate_question_node)
+workflow.add_node("check_sub", check_sub_node)
+workflow.add_node("handle_sub", handle_sub_node)
 workflow.add_node("evaluate_answer", evaluate_answer_node)
 workflow.add_node("decide_next_step", decide_next_step_node)
 workflow.add_node("generate_followup", generate_followup_node)
@@ -327,11 +409,21 @@ workflow.add_node("generate_report", generate_report_node)
 workflow.set_conditional_entry_point(
     route_entry,
     {
-        "evaluate_answer": "evaluate_answer",
+        "check_sub": "check_sub",
         "generate_question": "generate_question",
     },
 )
 
+workflow.add_conditional_edges(
+    "check_sub",
+    route_after_check,
+    {
+        "handle_sub": "handle_sub",
+        "evaluate_answer": "evaluate_answer",
+    },
+)
+
+workflow.add_edge("handle_sub", END)
 workflow.add_edge("evaluate_answer", "decide_next_step")
 workflow.add_conditional_edges(
     "decide_next_step",
@@ -371,6 +463,7 @@ def run_chat(state: InterviewState) -> dict:
 
     finished = final_state.interview_stage in ("finished", "aborted")
     aborted = final_state.interview_stage == "aborted"
+    is_sub = final_state.interview_stage == "sub"
     is_followup = final_state.interview_stage == "followup"
 
     return {
@@ -379,6 +472,7 @@ def run_chat(state: InterviewState) -> dict:
         "evaluation_detail": final_state.evaluation_detail,
         "finished": finished,
         "aborted": aborted,
+        "is_sub": is_sub,
         "is_followup": is_followup,
         "current_round": final_state.current_round,
         "followup_count": final_state.followup_count,
