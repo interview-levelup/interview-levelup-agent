@@ -1,34 +1,28 @@
-from langgraph import StateGraph
+import json
+
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 
 from state import InterviewState
+from model import llm
 
 
 def generate_question(state: InterviewState) -> InterviewState:
-    # build prompt for LLM based on state
     prompt = (
         f"You are an interviewer asking a {state.level} level "
         f"question for a {state.role} role in a {state.style} style. "
         "Generate exactly one question."
     )
-    # adjust difficulty with current_round
     if state.current_round > 0:
         prompt += f" Difficulty should increase with round {state.current_round}."
 
-    # call OpenAI chat completion
-    try:
-        from openai import ChatCompletion
-    except ImportError:
-        raise
+    response = llm.invoke([
+        {"role": "user", "content": prompt},
+    ],
+    max_tokens=100,
+    temperature=0.7)
+    question = response.content.strip() if hasattr(response, 'content') else str(response).strip()
 
-    response = ChatCompletion.create(
-        model="gpt-4.1",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=100,
-        temperature=0.7,
-    )
-    question = response.choices[0].message["content"].strip()
-
-    # update state
     state.current_question = question
     state.interview_history.append({
         "round": state.current_round,
@@ -38,35 +32,23 @@ def generate_question(state: InterviewState) -> InterviewState:
 
 
 def evaluate_answer(state: InterviewState) -> InterviewState:
-    # prepare prompt including question and candidate answer
     prompt = (
         "Evaluate the candidate's answer to the following interview question. "
         "Score between 1 and 10 based on clarity, structure, and depth. "
-        "Provide a JSON object with fields 'score' and 'details'.\n"  # details can elaborate on each criterion
+        "Provide a JSON object with fields 'score' and 'details'.\n"
         f"Question: {state.current_question}\n"
         f"Answer: {state.candidate_answer}\n"
     )
-
-    try:
-        from openai import ChatCompletion
-    except ImportError:
-        raise
-
-    response = ChatCompletion.create(
-        model="gpt-4.1",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=200,
-        temperature=0.3,
-    )
-    content = response.choices[0].message["content"].strip()
-
-    # attempt to parse JSON from content
-    import json
+    response = llm.invoke([
+        {"role": "user", "content": prompt},
+    ],
+    max_tokens=200,
+    temperature=0.3)
+    content = response.content.strip() if hasattr(response, 'content') else str(response).strip()
 
     try:
         result = json.loads(content)
     except json.JSONDecodeError:
-        # fallback: treat entire content as details with no score
         result = {"score": None, "details": content}
 
     score = result.get("score")
@@ -96,11 +78,47 @@ def decide_next_step(state: InterviewState) -> InterviewState:
 
 
 def generate_followup(state: InterviewState) -> InterviewState:
-    ...
+    prompt = (
+        "The candidate gave a weak answer. Ask a follow-up question to probe deeper.\n"
+        f"Original question: {state.current_question}\n"
+        f"Candidate's answer: {state.candidate_answer}\n"
+        "Generate exactly one follow-up question."
+    )
+    response = llm.invoke([
+        {"role": "user", "content": prompt},
+    ],
+    max_tokens=100,
+    temperature=0.7)
+    followup = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+
+    state.current_question = followup
+    state.interview_history.append({
+        "round": state.current_round,
+        "question": followup,
+        "type": "followup",
+    })
+    return state
 
 
 def generate_report(state: InterviewState) -> InterviewState:
-    ...
+    history_text = "\n".join(
+        f"Round {entry['round']}: {entry['question']}" for entry in state.interview_history
+    )
+    prompt = (
+        "Generate a final interview report summarizing the candidate's performance.\n"
+        f"Role: {state.role}, Level: {state.level}\n"
+        f"Interview history:\n{history_text}\n"
+        "Include overall assessment, strengths, and areas for improvement."
+    )
+    response = llm.invoke([
+        {"role": "user", "content": prompt},
+    ],
+    max_tokens=500,
+    temperature=0.5)
+    report = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+
+    state.final_report = report
+    return state
 
 
 # build the workflow graph
@@ -117,23 +135,24 @@ interview_graph.add_edge("generate_question", "evaluate_answer")
 interview_graph.add_edge("evaluate_answer", "decide_next_step")
 
 # conditional branching within decide_next_step
-
-interview_graph.add_conditional(
+interview_graph.add_conditional_edges(
     "decide_next_step",
-    lambda state: state.interview_stage == "followup",
-    "generate_followup",
-)
-interview_graph.add_conditional(
-    "decide_next_step",
-    lambda state: state.interview_stage == "question",
-    "generate_question",
-)
-interview_graph.add_conditional(
-    "decide_next_step",
-    lambda state: state.interview_stage == "finished",
-    "generate_report",
+    lambda state: state.interview_stage,
+    {
+        "followup": "generate_followup",
+        "question": "generate_question",
+        "finished": "generate_report",
+    },
 )
 
 # connect followup and report paths
 interview_graph.add_edge("generate_followup", "evaluate_answer")
-interview_graph.add_edge("generate_report", None)  # terminal
+interview_graph.add_edge("generate_report", END)
+
+interview_graph.set_entry_point("generate_question")
+
+memory = MemorySaver()
+graph_app = interview_graph.compile(
+    checkpointer=memory,
+    interrupt_before=["evaluate_answer"],
+)
