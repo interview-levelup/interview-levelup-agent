@@ -8,6 +8,63 @@ from state import InterviewState
 from model import llm
 
 
+# ── Language detection ──────────────────────────────────────────────────────────
+
+def _detect_script(text: str) -> str | None:
+    """Return a rough script family for the dominant non-ASCII characters."""
+    for ch in text:
+        cp = ord(ch)
+        if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+            return "chinese"
+        if 0x3040 <= cp <= 0x30FF:
+            return "japanese"
+        if 0xAC00 <= cp <= 0xD7AF:
+            return "korean"
+    return None
+
+
+def _lang_instruction(role: str, style: str = "", last_answer: str | None = None) -> str:
+    """
+    Returns a language rule to append to any user-facing prompt.
+
+    Two modes:
+    1. last_answer is provided (not the very first question):
+       Detect the script/language of the candidate's most recent answer and
+       instruct the LLM to continue in that language.  This makes the interview
+       automatically mirror however the candidate is writing.
+    2. No last_answer (first question):
+       Let the LLM infer the most natural language from the role name alone —
+       "前端工程师" → Chinese, "Frontend Engineer" → English, etc.
+       No hard-coded rules: the LLM is better at reading intent than regex.
+    """
+    if last_answer and last_answer.strip():
+        script = _detect_script(last_answer)
+        if script == "chinese":
+            lang_hint = "Simplified Chinese"
+        elif script == "japanese":
+            lang_hint = "Japanese"
+        elif script == "korean":
+            lang_hint = "Korean"
+        else:
+            # Fallback: quote the first 60 chars so the LLM can match the script itself
+            sample = last_answer.strip()[:60]
+            return (
+                f"Language rule: The candidate's last answer was: \"{sample}\" — "
+                "identify the language used and write your response in that exact language."
+            )
+        return (
+            f"Language rule: The candidate's last answer was in {lang_hint}. "
+            f"Write your response entirely in {lang_hint}."
+        )
+    else:
+        return (
+            f"Language rule: Choose the language most natural and expected for a candidate "
+            f"applying for the role \"{role}\". "
+            "For example, a Chinese job title implies Chinese; an English title implies English; "
+            "a role explicitly tied to another language (e.g. '英语翻译', 'French interpreter') "
+            "implies that target language. Do NOT default to English if the role name is in another language."
+        )
+
 # ── Node functions ─────────────────────────────────────────────────────────────
 # Each node returns a *partial* dict; LangGraph merges it into the state.
 
@@ -38,6 +95,7 @@ def generate_question_node(state: InterviewState) -> dict:
     )
     if state.current_round > 0:
         prompt += f" Difficulty should increase with round {state.current_round}."
+    prompt += f"\n\n{_lang_instruction(state.role, state.style, state.candidate_answer)}"
 
     response = llm.invoke([
         {"role": "user", "content": prompt},
@@ -56,10 +114,11 @@ def evaluate_answer_node(state: InterviewState) -> dict:
     prompt = (
         "Evaluate the candidate's answer to the following interview question. "
         "Score between 1 and 100 based on clarity, structure, and depth. "
-        "Provide a JSON object with fields 'score' (integer 1-100) and 'details' (markdown string)."
+        "Provide a JSON object with fields 'score' (integer 1-100) and 'details' (markdown string). "
         "The 'details' field may use markdown formatting such as bullet points and bold text.\n"
         f"Question: {state.current_question}\n"
         f"Answer: {state.candidate_answer}\n"
+        f"{_lang_instruction(state.role, state.style, state.candidate_answer)}\n"
         "Respond with ONLY the raw JSON object, no markdown code block, no extra text."
     )
     response = llm.invoke([
@@ -80,7 +139,20 @@ def evaluate_answer_node(state: InterviewState) -> dict:
         result = {"score": None, "details": content}
 
     score = result.get("score")
-    details = result.get("details")
+    # Some LLMs use "detail" instead of "details"
+    details = result.get("details") or result.get("detail")
+
+    # Guard: if details is itself a nested JSON string, unwrap it
+    if isinstance(details, str):
+        details_stripped = details.strip()
+        if details_stripped.startswith("{"):
+            try:
+                nested = json.loads(details_stripped)
+                details = nested.get("details") or nested.get("detail") or details
+                if score is None and nested.get("score") is not None:
+                    score = nested["score"]
+            except json.JSONDecodeError:
+                pass
 
     return {
         "evaluation_score": float(score) if score is not None else None,
@@ -95,15 +167,70 @@ def decide_next_step_node(state: InterviewState) -> dict:
     if state.current_round >= state.max_rounds - 1:
         return {"interview_stage": "finished"}
 
+    # ── Abort check: detect a disengaged candidate ────────────────────────────
+    # Collect up to the last 3 answers (history + current answer)
+    past_answers = [
+        entry["answer"]
+        for entry in state.interview_history
+        if entry.get("answer")
+    ]
+    recent_answers = (past_answers + [state.candidate_answer or ""])[-3:]
+
+    if len(recent_answers) >= 2:
+        answers_block = "\n".join(f"- {a}" for a in recent_answers)
+        abort_prompt = (
+            "You are judging candidate engagement in a job interview.\n"
+            "Here are the candidate's most recent answers:\n"
+            f"{answers_block}\n\n"
+            "If the candidate is clearly disengaged — e.g. giving insults, single dismissive "
+            "words, random characters, or repeatedly refusing to answer — respond with "
+            "exactly: ABORT\n"
+            "Otherwise respond with exactly: CONTINUE"
+        )
+        abort_resp = llm.invoke(
+            [{"role": "user", "content": abort_prompt}],
+            max_tokens=10,
+            temperature=0.0,
+        )
+        abort_text = (
+            abort_resp.content.strip()
+            if hasattr(abort_resp, "content")
+            else str(abort_resp).strip()
+        ).upper()
+        if "ABORT" in abort_text:
+            return {"interview_stage": "aborted"}
+
+    # ── Followup worthiness check ─────────────────────────────────────────────
     score = state.evaluation_score or 0
     if score < 60 and state.followup_count < 1:
-        return {"interview_stage": "followup", "followup_count": state.followup_count + 1}
-    else:
-        return {
-            "interview_stage": "question",
-            "current_round": state.current_round + 1,
-            "followup_count": 0,
-        }
+        followup_prompt = (
+            "You are a technical interviewer deciding whether a follow-up question adds value.\n"
+            f"Question: {state.current_question}\n"
+            f"Candidate's answer: {state.candidate_answer}\n\n"
+            "A follow-up is worthwhile ONLY if the candidate gave a partially relevant answer "
+            "that could be probed for more depth.\n"
+            "A follow-up is NOT worthwhile if the answer is an insult, completely off-topic, "
+            "nonsensical, or a single short dismissive word (e.g. '滚', 'no', '不').\n"
+            "Respond with exactly: YES or NO"
+        )
+        followup_resp = llm.invoke(
+            [{"role": "user", "content": followup_prompt}],
+            max_tokens=10,
+            temperature=0.0,
+        )
+        followup_text = (
+            followup_resp.content.strip()
+            if hasattr(followup_resp, "content")
+            else str(followup_resp).strip()
+        ).upper()
+        if "YES" in followup_text:
+            return {"interview_stage": "followup", "followup_count": state.followup_count + 1}
+
+    return {
+        "interview_stage": "question",
+        "current_round": state.current_round + 1,
+        "followup_count": 0,
+    }
 
 
 def generate_followup_node(state: InterviewState) -> dict:
@@ -113,7 +240,8 @@ def generate_followup_node(state: InterviewState) -> dict:
         f"Candidate's answer: {state.candidate_answer}\n"
         "Generate exactly one follow-up question. "
         "IMPORTANT: This is a face-to-face verbal interview. Do NOT ask the candidate "
-        "to write, type, or produce any code."
+        "to write, type, or produce any code.\n"
+        f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
     )
     response = llm.invoke([
         {"role": "user", "content": prompt},
@@ -153,7 +281,8 @@ def generate_report_node(state: InterviewState) -> dict:
         "2. Key strengths demonstrated\n"
         "3. Areas for improvement\n"
         "4. Final recommendation\n"
-        "Use Markdown headings and bullet points. Base the report ONLY on the transcript above."
+        "Use Markdown headings and bullet points. Base the report ONLY on the transcript above.\n\n"
+        f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
     )
     response = llm.invoke([
         {"role": "user", "content": prompt},
@@ -181,6 +310,7 @@ def route_after_decide(
         "question": "generate_question",
         "followup": "generate_followup",
         "finished": "generate_report",
+        "aborted": "generate_report",   # aborted also generates a report
     }[state.interview_stage]
 
 
@@ -239,7 +369,8 @@ def run_chat(state: InterviewState) -> dict:
     else:
         final_state = final
 
-    finished = final_state.interview_stage == "finished"
+    finished = final_state.interview_stage in ("finished", "aborted")
+    aborted = final_state.interview_stage == "aborted"
     is_followup = final_state.interview_stage == "followup"
 
     return {
@@ -247,6 +378,7 @@ def run_chat(state: InterviewState) -> dict:
         "evaluation_score": final_state.evaluation_score,
         "evaluation_detail": final_state.evaluation_detail,
         "finished": finished,
+        "aborted": aborted,
         "is_followup": is_followup,
         "current_round": final_state.current_round,
         "followup_count": final_state.followup_count,
