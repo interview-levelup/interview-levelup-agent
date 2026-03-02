@@ -1,11 +1,17 @@
 import json
 import re
+from typing import Literal
+
+from langgraph.graph import StateGraph, END
 
 from state import InterviewState
 from model import llm
 
 
-def generate_question(state: InterviewState) -> InterviewState:
+# ── Node functions ─────────────────────────────────────────────────────────────
+# Each node returns a *partial* dict; LangGraph merges it into the state.
+
+def generate_question_node(state: InterviewState) -> dict:
     # Build a list of topics already covered so the LLM avoids repeating them
     previous_questions = [
         entry["question"]
@@ -40,15 +46,13 @@ def generate_question(state: InterviewState) -> InterviewState:
     temperature=0.7)
     question = response.content.strip() if hasattr(response, 'content') else str(response).strip()
 
-    state.current_question = question
-    state.interview_history.append({
-        "round": state.current_round,
-        "question": question,
-    })
-    return state
+    updated_history = state.interview_history + [
+        {"round": state.current_round, "question": question}
+    ]
+    return {"current_question": question, "interview_history": updated_history}
 
 
-def evaluate_answer(state: InterviewState) -> InterviewState:
+def evaluate_answer_node(state: InterviewState) -> dict:
     prompt = (
         "Evaluate the candidate's answer to the following interview question. "
         "Score between 1 and 100 based on clarity, structure, and depth. "
@@ -78,32 +82,31 @@ def evaluate_answer(state: InterviewState) -> InterviewState:
     score = result.get("score")
     details = result.get("details")
 
-    state.evaluation_score = float(score) if score is not None else None
-    state.evaluation_detail = details
-    return state
+    return {
+        "evaluation_score": float(score) if score is not None else None,
+        "evaluation_detail": details,
+    }
 
 
-def decide_next_step(state: InterviewState) -> InterviewState:
+def decide_next_step_node(state: InterviewState) -> dict:
     # Finish BEFORE generating the next question when we've used all main rounds.
     # current_round is 0-indexed and only increments on main questions, so
     # finishing when current_round >= max_rounds - 1 gives exactly max_rounds total.
     if state.current_round >= state.max_rounds - 1:
-        state.interview_stage = "finished"
-        return state
+        return {"interview_stage": "finished"}
 
     score = state.evaluation_score or 0
     if score < 60 and state.followup_count < 1:
-        state.interview_stage = "followup"
-        state.followup_count += 1
+        return {"interview_stage": "followup", "followup_count": state.followup_count + 1}
     else:
-        state.interview_stage = "question"
-        state.current_round += 1
-        state.followup_count = 0
+        return {
+            "interview_stage": "question",
+            "current_round": state.current_round + 1,
+            "followup_count": 0,
+        }
 
-    return state
 
-
-def generate_followup(state: InterviewState) -> InterviewState:
+def generate_followup_node(state: InterviewState) -> dict:
     prompt = (
         "The candidate gave a weak answer. Ask a follow-up question to probe deeper.\n"
         f"Original question: {state.current_question}\n"
@@ -119,16 +122,13 @@ def generate_followup(state: InterviewState) -> InterviewState:
     temperature=0.7)
     followup = response.content.strip() if hasattr(response, 'content') else str(response).strip()
 
-    state.current_question = followup
-    state.interview_history.append({
-        "round": state.current_round,
-        "question": followup,
-        "type": "followup",
-    })
-    return state
+    updated_history = state.interview_history + [
+        {"round": state.current_round, "question": followup, "type": "followup"}
+    ]
+    return {"current_question": followup, "interview_history": updated_history}
 
 
-def generate_report(state: InterviewState) -> InterviewState:
+def generate_report_node(state: InterviewState) -> dict:
     lines = []
     for entry in state.interview_history:
         label = "Follow-up" if entry.get("type") == "followup" else f"Q{entry['round'] + 1}"
@@ -162,53 +162,95 @@ def generate_report(state: InterviewState) -> InterviewState:
     temperature=0.5)
     report = response.content.strip() if hasattr(response, 'content') else str(response).strip()
 
-    state.final_report = report
-    return state
+    return {"final_report": report}
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Routing functions ──────────────────────────────────────────────────────────
 
-def run_start(role: str, level: str, style: str, max_rounds: int) -> str:
-    """Generate the very first interview question. Stateless."""
-    state = InterviewState(role=role, level=level, style=style, max_rounds=max_rounds)
-    state = generate_question(state)
-    return state.current_question
+def route_entry(state: InterviewState) -> Literal["evaluate_answer", "generate_question"]:
+    """No answer → start of interview, generate first question directly."""
+    if state.candidate_answer is not None:
+        return "evaluate_answer"
+    return "generate_question"
 
 
-def run_evaluate_and_next(state: InterviewState) -> dict:
-    """Evaluate candidate's answer, decide next step, return result dict."""
-    state = evaluate_answer(state)
-    state = decide_next_step(state)
-
-    if state.interview_stage == "finished":
-        state = generate_report(state)
-        return {
-            "evaluation_score": state.evaluation_score,
-            "evaluation_detail": state.evaluation_detail,
-            "finished": True,
-            "report": state.final_report,
-        }
-
-    if state.interview_stage == "followup":
-        state = generate_followup(state)
-        return {
-            "evaluation_score": state.evaluation_score,
-            "evaluation_detail": state.evaluation_detail,
-            "finished": False,
-            "next_question": state.current_question,
-            "is_followup": True,
-            "current_round": state.current_round,
-            "followup_count": state.followup_count,
-        }
-
-    # stage == "question" → new main question
-    state = generate_question(state)
+def route_after_decide(
+    state: InterviewState,
+) -> Literal["generate_question", "generate_followup", "generate_report"]:
     return {
-        "evaluation_score": state.evaluation_score,
-        "evaluation_detail": state.evaluation_detail,
-        "finished": False,
-        "next_question": state.current_question,
-        "is_followup": False,
-        "current_round": state.current_round,
-        "followup_count": state.followup_count,
+        "question": "generate_question",
+        "followup": "generate_followup",
+        "finished": "generate_report",
+    }[state.interview_stage]
+
+
+# ── Build and compile the graph ────────────────────────────────────────────────
+
+workflow = StateGraph(InterviewState)
+
+workflow.add_node("generate_question", generate_question_node)
+workflow.add_node("evaluate_answer", evaluate_answer_node)
+workflow.add_node("decide_next_step", decide_next_step_node)
+workflow.add_node("generate_followup", generate_followup_node)
+workflow.add_node("generate_report", generate_report_node)
+
+workflow.set_conditional_entry_point(
+    route_entry,
+    {
+        "evaluate_answer": "evaluate_answer",
+        "generate_question": "generate_question",
+    },
+)
+
+workflow.add_edge("evaluate_answer", "decide_next_step")
+workflow.add_conditional_edges(
+    "decide_next_step",
+    route_after_decide,
+    {
+        "generate_question": "generate_question",
+        "generate_followup": "generate_followup",
+        "generate_report": "generate_report",
+    },
+)
+
+workflow.add_edge("generate_question", END)
+workflow.add_edge("generate_followup", END)
+workflow.add_edge("generate_report", END)
+
+graph = workflow.compile()
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def run_chat(state: InterviewState) -> dict:
+    """
+    Run the interview graph from the given state.
+
+    - Start call:  candidate_answer is None  → routes to generate_question
+    - Answer call: candidate_answer is set   → routes to evaluate_answer → decide → ...
+
+    Returns a unified response dict consumed by the backend.
+    """
+    final = graph.invoke(state)
+
+    # LangGraph returns a dict for StateGraph; reconstruct the Pydantic model.
+    if isinstance(final, dict):
+        final_state = InterviewState(**final)
+    else:
+        final_state = final
+
+    finished = final_state.interview_stage == "finished"
+    is_followup = final_state.interview_stage == "followup"
+
+    return {
+        "question": final_state.current_question,
+        "evaluation_score": final_state.evaluation_score,
+        "evaluation_detail": final_state.evaluation_detail,
+        "finished": finished,
+        "is_followup": is_followup,
+        "current_round": final_state.current_round,
+        "followup_count": final_state.followup_count,
+        "report": final_state.final_report if finished else None,
     }
+
+# (run_start and run_evaluate_and_next removed — use run_chat instead)
