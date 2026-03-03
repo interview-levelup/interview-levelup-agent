@@ -286,9 +286,10 @@ def generate_followup_node(state: InterviewState, config: RunnableConfig = None)
 
 
 def generate_report_node(state: InterviewState, config: RunnableConfig = None) -> dict:
-    stream_cb: Optional[Callable[[str], None]] = (
-        config.get("configurable", {}).get("stream_cb") if config else None
-    )
+    # Intentionally NOT using stream_cb here — the report is returned only in
+    # the final "done" payload and stored in the DB.  Streaming report tokens
+    # would cause the frontend to display the report as a chat bubble and read
+    # it aloud via TTS, which is not the desired behaviour.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines = []
     for entry in state.interview_history:
@@ -318,19 +319,10 @@ def generate_report_node(state: InterviewState, config: RunnableConfig = None) -
         "Use Markdown headings and bullet points. Base the report ONLY on the transcript above.\n\n"
         f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
     )
-    if stream_cb:
-        report = ""
-        for chunk in llm.stream([{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5):
-            token = chunk.content if hasattr(chunk, "content") else ""
-            if token:
-                stream_cb(token)
-                report += token
-        report = report.strip()
-    else:
-        response = llm.invoke(
-            [{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5
-        )
-        report = response.content.strip() if hasattr(response, "content") else str(response).strip()
+    response = llm.invoke(
+        [{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5
+    )
+    report = response.content.strip() if hasattr(response, "content") else str(response).strip()
 
     return {"final_report": report}
 
