@@ -1,6 +1,10 @@
+import asyncio
+import json
+import threading
 from typing import List, Optional
 
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from state import InterviewState
@@ -68,3 +72,63 @@ def chat(req: ChatRequest):
     )
     result = run_chat(state)
     return ChatResponse(**result)
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    Same as /chat but streams the interviewer's question via SSE as it is generated.
+    Events:
+      data: {"type": "token",  "content": "<token>"}   — one per LLM output token
+      data: {"type": "done",   <all ChatResponse fields>}  — sent after graph finishes
+      data: {"type": "error",  "message": "..."}  — on failure
+    """
+    state = InterviewState(
+        role=req.role,
+        level=req.level,
+        style=req.style,
+        max_rounds=req.max_rounds,
+        current_round=req.current_round,
+        followup_count=req.followup_count,
+        current_question=req.current_question,
+        candidate_answer=req.answer,
+        interview_history=[e.model_dump(exclude_none=True) for e in req.interview_history],
+    )
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+    result_holder: dict = {}
+
+    def stream_cb(token: str) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, token)
+
+    def run_in_thread() -> None:
+        try:
+            result = run_chat(state, stream_cb=stream_cb)
+            result_holder.update(result)
+        except Exception as exc:  # noqa: BLE001
+            result_holder["_error"] = str(exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+    threading.Thread(target=run_in_thread, daemon=True).start()
+
+    async def generator():
+        while True:
+            token = await queue.get()
+            if token is None:
+                break
+            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+        if "_error" in result_holder:
+            yield f"data: {json.dumps({'type': 'error', 'message': result_holder['_error']})}\n\n"
+        else:
+            payload = {"type": "done", **result_holder}
+            yield f"data: {json.dumps(payload)}\n\n"
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+

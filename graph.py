@@ -1,8 +1,9 @@
 import json
 import re
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, Optional, Callable
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 
 from state import InterviewState
@@ -69,7 +70,10 @@ def _lang_instruction(role: str, style: str = "", last_answer: str | None = None
 # ── Node functions ─────────────────────────────────────────────────────────────
 # Each node returns a *partial* dict; LangGraph merges it into the state.
 
-def generate_question_node(state: InterviewState) -> dict:
+def generate_question_node(state: InterviewState, config: RunnableConfig = None) -> dict:
+    stream_cb: Optional[Callable[[str], None]] = (
+        config.get("configurable", {}).get("stream_cb") if config else None
+    )
     # Build a list of topics already covered so the LLM avoids repeating them
     previous_questions = [
         entry["question"]
@@ -98,12 +102,19 @@ def generate_question_node(state: InterviewState) -> dict:
         prompt += f" Difficulty should increase with round {state.current_round}."
     prompt += f"\n\n{_lang_instruction(state.role, state.style, state.candidate_answer)}"
 
-    response = llm.invoke([
-        {"role": "user", "content": prompt},
-    ],
-    max_tokens=100,
-    temperature=0.7)
-    question = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+    if stream_cb:
+        question = ""
+        for chunk in llm.stream([{"role": "user", "content": prompt}], max_tokens=100, temperature=0.7):
+            token = chunk.content if hasattr(chunk, "content") else ""
+            if token:
+                stream_cb(token)
+                question += token
+        question = question.strip()
+    else:
+        response = llm.invoke(
+            [{"role": "user", "content": prompt}], max_tokens=100, temperature=0.7
+        )
+        question = response.content.strip() if hasattr(response, "content") else str(response).strip()
 
     updated_history = state.interview_history + [
         {"round": state.current_round, "question": question}
@@ -241,7 +252,10 @@ def decide_next_step_node(state: InterviewState) -> dict:
     }
 
 
-def generate_followup_node(state: InterviewState) -> dict:
+def generate_followup_node(state: InterviewState, config: RunnableConfig = None) -> dict:
+    stream_cb: Optional[Callable[[str], None]] = (
+        config.get("configurable", {}).get("stream_cb") if config else None
+    )
     prompt = (
         "The candidate gave a weak answer. Ask a follow-up question to probe deeper.\n"
         f"Original question: {state.current_question}\n"
@@ -251,12 +265,19 @@ def generate_followup_node(state: InterviewState) -> dict:
         "to write, type, or produce any code.\n"
         f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
     )
-    response = llm.invoke([
-        {"role": "user", "content": prompt},
-    ],
-    max_tokens=100,
-    temperature=0.7)
-    followup = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+    if stream_cb:
+        followup = ""
+        for chunk in llm.stream([{"role": "user", "content": prompt}], max_tokens=100, temperature=0.7):
+            token = chunk.content if hasattr(chunk, "content") else ""
+            if token:
+                stream_cb(token)
+                followup += token
+        followup = followup.strip()
+    else:
+        response = llm.invoke(
+            [{"role": "user", "content": prompt}], max_tokens=100, temperature=0.7
+        )
+        followup = response.content.strip() if hasattr(response, "content") else str(response).strip()
 
     updated_history = state.interview_history + [
         {"round": state.current_round, "question": followup, "type": "followup"}
@@ -264,7 +285,10 @@ def generate_followup_node(state: InterviewState) -> dict:
     return {"current_question": followup, "interview_history": updated_history}
 
 
-def generate_report_node(state: InterviewState) -> dict:
+def generate_report_node(state: InterviewState, config: RunnableConfig = None) -> dict:
+    stream_cb: Optional[Callable[[str], None]] = (
+        config.get("configurable", {}).get("stream_cb") if config else None
+    )
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines = []
     for entry in state.interview_history:
@@ -294,12 +318,19 @@ def generate_report_node(state: InterviewState) -> dict:
         "Use Markdown headings and bullet points. Base the report ONLY on the transcript above.\n\n"
         f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
     )
-    response = llm.invoke([
-        {"role": "user", "content": prompt},
-    ],
-    max_tokens=500,
-    temperature=0.5)
-    report = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+    if stream_cb:
+        report = ""
+        for chunk in llm.stream([{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5):
+            token = chunk.content if hasattr(chunk, "content") else ""
+            if token:
+                stream_cb(token)
+                report += token
+        report = report.strip()
+    else:
+        response = llm.invoke(
+            [{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5
+        )
+        report = response.content.strip() if hasattr(response, "content") else str(response).strip()
 
     return {"final_report": report}
 
@@ -345,12 +376,15 @@ def check_sub_node(state: InterviewState) -> dict:
     return {"interview_stage": "evaluating"}
 
 
-def handle_sub_node(state: InterviewState) -> dict:
+def handle_sub_node(state: InterviewState, config: RunnableConfig = None) -> dict:
     """
     Respond to the candidate's sub-question / request directed back at the interviewer.
     This could be a request for clarification, an example, more context, a rephrasing,
     or any other interviewer-directed inquiry. Respond helpfully and stay on the same topic.
     """
+    stream_cb: Optional[Callable[[str], None]] = (
+        config.get("configurable", {}).get("stream_cb") if config else None
+    )
     prompt = (
         "You are an interviewer conducting a job interview. "
         "The candidate has responded to your question not with an answer, "
@@ -362,12 +396,19 @@ def handle_sub_node(state: InterviewState) -> dict:
         "End your response with the question restated (or refined) so the candidate knows what to answer.\n"
         f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
     )
-    resp = llm.invoke(
-        [{"role": "user", "content": prompt}],
-        max_tokens=200,
-        temperature=0.5,
-    )
-    response_text = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
+    if stream_cb:
+        response_text = ""
+        for chunk in llm.stream([{"role": "user", "content": prompt}], max_tokens=200, temperature=0.5):
+            token = chunk.content if hasattr(chunk, "content") else ""
+            if token:
+                stream_cb(token)
+                response_text += token
+        response_text = response_text.strip()
+    else:
+        resp = llm.invoke(
+            [{"role": "user", "content": prompt}], max_tokens=200, temperature=0.5
+        )
+        response_text = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
     return {"current_question": response_text}
 
 
@@ -448,7 +489,7 @@ graph = workflow.compile()
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def run_chat(state: InterviewState) -> dict:
+def run_chat(state: InterviewState, stream_cb: Optional[Callable[[str], None]] = None) -> dict:
     """
     Run the interview graph from the given state.
 
@@ -456,8 +497,10 @@ def run_chat(state: InterviewState) -> dict:
     - Answer call: candidate_answer is set   → routes to evaluate_answer → decide → ...
 
     Returns a unified response dict consumed by the backend.
+    If stream_cb is provided, question-generating nodes will call it token-by-token.
     """
-    final = graph.invoke(state)
+    cfg = {"configurable": {"stream_cb": stream_cb}} if stream_cb else None
+    final = graph.invoke(state, config=cfg)
 
     # LangGraph returns a dict for StateGraph; reconstruct the Pydantic model.
     if isinstance(final, dict):

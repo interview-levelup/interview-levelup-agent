@@ -2,5 +2,7 @@ fastapi
 pydantic
 openai
 langgraph
+langchain-core
 uvicorn
 python-dotenv
+python-multipart
