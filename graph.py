@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime, timezone
 from typing import Literal
 
 from langgraph.graph import StateGraph, END
@@ -264,6 +265,7 @@ def generate_followup_node(state: InterviewState) -> dict:
 
 
 def generate_report_node(state: InterviewState) -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines = []
     for entry in state.interview_history:
         label = "Follow-up" if entry.get("type") == "followup" else f"Q{entry['round'] + 1}"
@@ -281,7 +283,8 @@ def generate_report_node(state: InterviewState) -> dict:
     history_text = "\n".join(lines)
     prompt = (
         "Generate a comprehensive final interview report in Markdown format.\n"
-        f"Role: {state.role}, Level: {state.level}\n\n"
+        f"Role: {state.role}, Level: {state.level}\n"
+        f"Interview date: {today}\n\n"
         f"Full interview transcript:\n{history_text}\n\n"
         "The report must include:\n"
         "1. Overall assessment\n"
@@ -305,33 +308,29 @@ def generate_report_node(state: InterviewState) -> dict:
 
 def check_sub_node(state: InterviewState) -> dict:
     """
-    Detect whether the candidate is directing a sub-question back at the interviewer
-    rather than actually answering the question.
-
-    Sub-interactions include (but are not limited to):
-    - Asking for clarification or rephrasing ("could you explain?", "能说细点吗")
-    - Asking for an example ("could you give an example?")
-    - Asking for more context about the scenario ("what's the tech stack?")
-    - Pushing back on the question ("that seems too broad, could you narrow it?")
-    - Any reply that is a question directed at the interviewer rather than an attempt to answer
+    Let the LLM decide whether the candidate is:
+    - ending the interview entirely (END)
+    - directing a sub-question back at the interviewer (SUB)
+    - actually attempting to answer (ANSWER)
     """
     prompt = (
         "You are an interviewer in a job interview.\n"
         f"You asked: {state.current_question}\n"
         f"The candidate replied: {state.candidate_answer}\n\n"
-        "Classify the candidate's reply as SUB or ANSWER using these strict rules:\n\n"
-        "SUB — the candidate is asking the INTERVIEWER something, for example:\n"
-        "  '能举个例子吗', '你的意思是…?', 'could you give an example?', "
-        "'what do you mean by X?', 'can you rephrase?', 'what tech stack should I assume?'\n"
-        "  A SUB reply is a genuine QUESTION or REQUEST directed at the interviewer.\n\n"
+        "Classify the candidate's reply using these strict rules:\n\n"
+        "END — the candidate wants to stop/terminate the whole interview entirely.\n"
+        "  This includes explicit requests to end, quit, or stop the interview itself — "
+        "not just this question.\n"
+        "  e.g. '结束面试', '我想结束了', '不想继续面试了', '不想接受面试了',\n"
+        "  'end the interview', 'I want to quit', 'I\'m done with this interview'.\n\n"
+        "SUB — the candidate is asking the interviewer something about THIS specific question.\n"
+        "  e.g. '能举个例子吗', '你的意思是…?', '这题能再说清楚点吗',\n"
+        "  'could you give an example?', 'what do you mean by X?', 'can you rephrase?'\n\n"
         "ANSWER — everything else, including:\n"
-        "  - Weak or partial answers ('我不确定', 'I think maybe…')\n"
-        "  - Admissions of not knowing ('我不清楚', '不知道', 'I don't know', '不太了解')\n"
-        "  - Requests to skip or move on ('下一题吧', '跳过', 'skip this', 'next question please', "
-        "'换一个问题', '我想跳过')\n"
-        "  - Giving up or refusing ('算了', 'pass', '不想答')\n"
-        "  Even if the candidate cannot answer, that is still an ANSWER, not a SUB.\n\n"
-        "Respond with exactly one word: SUB or ANSWER"
+        "  - Weak/partial answers or admissions of not knowing\n"
+        "  - Requests to skip this one question ('下一题吧', 'pass', '跳过')\n"
+        "  - Giving up on answering this question\n\n"
+        "Respond with exactly one word: END, SUB, or ANSWER"
     )
     resp = llm.invoke(
         [{"role": "user", "content": prompt}],
@@ -339,6 +338,8 @@ def check_sub_node(state: InterviewState) -> dict:
         temperature=0.0,
     )
     text = (resp.content.strip() if hasattr(resp, "content") else str(resp).strip()).upper()
+    if "END" in text:
+        return {"interview_stage": "user_end"}
     if "SUB" in text:
         return {"interview_stage": "sub"}
     return {"interview_stage": "evaluating"}
@@ -378,6 +379,8 @@ def route_entry(state: InterviewState) -> str:
 
 
 def route_after_check(state: InterviewState) -> str:
+    if state.interview_stage == "user_end":
+        return "generate_report"
     if state.interview_stage == "sub":
         return "handle_sub"
     return "evaluate_answer"
@@ -420,6 +423,7 @@ workflow.add_conditional_edges(
     {
         "handle_sub": "handle_sub",
         "evaluate_answer": "evaluate_answer",
+        "generate_report": "generate_report",
     },
 )
 
@@ -461,8 +465,9 @@ def run_chat(state: InterviewState) -> dict:
     else:
         final_state = final
 
-    finished = final_state.interview_stage in ("finished", "aborted")
+    finished = final_state.interview_stage in ("finished", "aborted", "user_end")
     aborted = final_state.interview_stage == "aborted"
+    user_ended = final_state.interview_stage == "user_end"
     is_sub = final_state.interview_stage == "sub"
     is_followup = final_state.interview_stage == "followup"
 
@@ -472,6 +477,7 @@ def run_chat(state: InterviewState) -> dict:
         "evaluation_detail": final_state.evaluation_detail,
         "finished": finished,
         "aborted": aborted,
+        "user_ended": user_ended,
         "is_sub": is_sub,
         "is_followup": is_followup,
         "current_round": final_state.current_round,
