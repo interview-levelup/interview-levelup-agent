@@ -117,6 +117,27 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
+## Docker
+
+```bash
+# Export required variables (or put them in your shell profile)
+export LLM_API_KEY=your_key
+export LLM_BASE_URL=https://api.siliconflow.cn/v1
+export LLM_MODEL=deepseek-ai/DeepSeek-V3.2
+
+# Start (default external port 8000)
+docker compose up --build -d
+
+# Start with a custom external port
+AGENT_PORT=9090 docker compose up --build -d
+
+# Logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -124,3 +145,5 @@ uvicorn main:app --reload --port 8000
 | `LLM_API_KEY` | — | API key for the LLM provider |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `LLM_MODEL` | `gpt-4o` | Model name |
+| `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `AGENT_PORT` | `8000` | Host port mapped to the container (Docker only) |

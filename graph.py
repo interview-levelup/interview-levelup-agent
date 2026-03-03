@@ -6,8 +6,11 @@ from typing import Literal, Optional, Callable
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 
+from logger import get_logger
 from state import InterviewState
 from model import llm
+
+log = get_logger(__name__)
 
 
 # ── Language detection ──────────────────────────────────────────────────────────
@@ -71,6 +74,8 @@ def _lang_instruction(role: str, style: str = "", last_answer: str | None = None
 # Each node returns a *partial* dict; LangGraph merges it into the state.
 
 def generate_question_node(state: InterviewState, config: RunnableConfig = None) -> dict:
+    log.info("[generate_question] role=%s level=%s round=%d streaming=%s",
+             state.role, state.level, state.current_round, config is not None)
     stream_cb: Optional[Callable[[str], None]] = (
         config.get("configurable", {}).get("stream_cb") if config else None
     )
@@ -116,6 +121,7 @@ def generate_question_node(state: InterviewState, config: RunnableConfig = None)
         )
         question = response.content.strip() if hasattr(response, "content") else str(response).strip()
 
+    log.debug("[generate_question] question=%r", question[:80] if question else "")
     updated_history = state.interview_history + [
         {"round": state.current_round, "question": question}
     ]
@@ -123,6 +129,9 @@ def generate_question_node(state: InterviewState, config: RunnableConfig = None)
 
 
 def evaluate_answer_node(state: InterviewState) -> dict:
+    log.info("[evaluate_answer] role=%s round=%d question=%r",
+             state.role, state.current_round,
+             (state.current_question or "")[:60])
     prompt = (
         "Evaluate the candidate's answer to the following interview question. "
         "Score between 1 and 100 based on clarity, structure, and depth. "
@@ -148,6 +157,7 @@ def evaluate_answer_node(state: InterviewState) -> dict:
     try:
         result = json.loads(content)
     except json.JSONDecodeError:
+        log.warning("[evaluate_answer] JSON decode failed, raw content=%r", content[:200])
         result = {"score": None, "details": content}
 
     score = result.get("score")
@@ -166,6 +176,7 @@ def evaluate_answer_node(state: InterviewState) -> dict:
             except json.JSONDecodeError:
                 pass
 
+    log.info("[evaluate_answer] score=%s", score)
     return {
         "evaluation_score": float(score) if score is not None else None,
         "evaluation_detail": details,
@@ -173,6 +184,9 @@ def evaluate_answer_node(state: InterviewState) -> dict:
 
 
 def decide_next_step_node(state: InterviewState) -> dict:
+    log.info("[decide_next_step] role=%s round=%d/%d score=%s followup_count=%d",
+             state.role, state.current_round, state.max_rounds,
+             state.evaluation_score, state.followup_count)
     # Finish BEFORE generating the next question when we've used all main rounds.
     # current_round is 0-indexed and only increments on main questions, so
     # finishing when current_round >= max_rounds - 1 gives exactly max_rounds total.
@@ -217,6 +231,8 @@ def decide_next_step_node(state: InterviewState) -> dict:
             else str(abort_resp).strip()
         ).upper()
         if "ABORT" in abort_text:
+            log.warning("[decide_next_step] ABORT triggered | role=%s round=%d",
+                        state.role, state.current_round)
             return {"interview_stage": "aborted"}
 
     # ── Followup worthiness check ─────────────────────────────────────────────
@@ -243,16 +259,21 @@ def decide_next_step_node(state: InterviewState) -> dict:
             else str(followup_resp).strip()
         ).upper()
         if "YES" in followup_text:
+            log.info("[decide_next_step] -> followup")
             return {"interview_stage": "followup", "followup_count": state.followup_count + 1}
 
+    next_round = state.current_round + 1
+    log.info("[decide_next_step] -> next question (round %d)", next_round)
     return {
         "interview_stage": "question",
-        "current_round": state.current_round + 1,
+        "current_round": next_round,
         "followup_count": 0,
     }
 
 
 def generate_followup_node(state: InterviewState, config: RunnableConfig = None) -> dict:
+    log.info("[generate_followup] role=%s round=%d score=%s",
+             state.role, state.current_round, state.evaluation_score)
     stream_cb: Optional[Callable[[str], None]] = (
         config.get("configurable", {}).get("stream_cb") if config else None
     )
@@ -286,10 +307,11 @@ def generate_followup_node(state: InterviewState, config: RunnableConfig = None)
 
 
 def generate_report_node(state: InterviewState, config: RunnableConfig = None) -> dict:
-    # Intentionally NOT using stream_cb here — the report is returned only in
-    # the final "done" payload and stored in the DB.  Streaming report tokens
-    # would cause the frontend to display the report as a chat bubble and read
-    # it aloud via TTS, which is not the desired behaviour.
+    log.info("[generate_report] role=%s stage=%s rounds_completed=%d",
+             state.role, state.interview_stage, state.current_round)
+    stream_cb: Optional[Callable[[str], None]] = (
+        config.get("configurable", {}).get("stream_cb") if config else None
+    )
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines = []
     for entry in state.interview_history:
@@ -319,10 +341,19 @@ def generate_report_node(state: InterviewState, config: RunnableConfig = None) -
         "Use Markdown headings and bullet points. Base the report ONLY on the transcript above.\n\n"
         f"{_lang_instruction(state.role, state.style, state.candidate_answer)}"
     )
-    response = llm.invoke(
-        [{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5
-    )
-    report = response.content.strip() if hasattr(response, "content") else str(response).strip()
+    if stream_cb:
+        report = ""
+        for chunk in llm.stream([{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5):
+            token = chunk.content if hasattr(chunk, "content") else ""
+            if token:
+                stream_cb(token)
+                report += token
+        report = report.strip()
+    else:
+        response = llm.invoke(
+            [{"role": "user", "content": prompt}], max_tokens=500, temperature=0.5
+        )
+        report = response.content.strip() if hasattr(response, "content") else str(response).strip()
 
     return {"final_report": report}
 
@@ -336,6 +367,9 @@ def check_sub_node(state: InterviewState) -> dict:
     - directing a sub-question back at the interviewer (SUB)
     - actually attempting to answer (ANSWER)
     """
+    log.info("[check_sub] role=%s round=%d answer=%r",
+             state.role, state.current_round,
+             (state.candidate_answer or "")[:60])
     prompt = (
         "You are an interviewer in a job interview.\n"
         f"You asked: {state.current_question}\n"
@@ -361,6 +395,7 @@ def check_sub_node(state: InterviewState) -> dict:
         temperature=0.0,
     )
     text = (resp.content.strip() if hasattr(resp, "content") else str(resp).strip()).upper()
+    log.info("[check_sub] classification=%s", text)
     if "END" in text:
         return {"interview_stage": "user_end"}
     if "SUB" in text:
@@ -374,6 +409,7 @@ def handle_sub_node(state: InterviewState, config: RunnableConfig = None) -> dic
     This could be a request for clarification, an example, more context, a rephrasing,
     or any other interviewer-directed inquiry. Respond helpfully and stay on the same topic.
     """
+    log.info("[handle_sub] role=%s round=%d", state.role, state.current_round)
     stream_cb: Optional[Callable[[str], None]] = (
         config.get("configurable", {}).get("stream_cb") if config else None
     )
@@ -476,7 +512,9 @@ workflow.add_edge("generate_question", END)
 workflow.add_edge("generate_followup", END)
 workflow.add_edge("generate_report", END)
 
+log.info("Compiling LangGraph workflow ...")
 graph = workflow.compile()
+log.info("LangGraph workflow compiled and ready")
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

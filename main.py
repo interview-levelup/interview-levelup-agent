@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 from typing import List, Optional
 
@@ -7,10 +8,24 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from logger import get_logger
 from state import InterviewState
 from graph import run_chat
 
+log = get_logger(__name__)
+
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    from logger import reconfigure
+    reconfigure()
+    log.info("=" * 60)
+    log.info("interview-levelup-agent is up and accepting requests")
+    log.info("  POST /chat        — blocking")
+    log.info("  POST /chat/stream — SSE streaming")
+    log.info("=" * 60)
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -59,6 +74,11 @@ def chat(req: ChatRequest):
     - No answer (current_question=None, answer=None) -> generates first question.
     - With answer -> evaluates answer, decides next step, returns result.
     """
+    log.info(
+        "POST /chat | role=%s level=%s round=%d/%d has_answer=%s",
+        req.role, req.level, req.current_round, req.max_rounds,
+        req.answer is not None,
+    )
     state = InterviewState(
         role=req.role,
         level=req.level,
@@ -71,6 +91,11 @@ def chat(req: ChatRequest):
         interview_history=[e.model_dump(exclude_none=True) for e in req.interview_history],
     )
     result = run_chat(state)
+    log.info(
+        "POST /chat done | finished=%s aborted=%s is_followup=%s score=%s",
+        result.get("finished"), result.get("aborted"),
+        result.get("is_followup"), result.get("evaluation_score"),
+    )
     return ChatResponse(**result)
 
 
@@ -83,6 +108,11 @@ async def chat_stream(req: ChatRequest):
       data: {"type": "done",   <all ChatResponse fields>}  — sent after graph finishes
       data: {"type": "error",  "message": "..."}  — on failure
     """
+    log.info(
+        "POST /chat/stream | role=%s level=%s round=%d/%d has_answer=%s",
+        req.role, req.level, req.current_round, req.max_rounds,
+        req.answer is not None,
+    )
     state = InterviewState(
         role=req.role,
         level=req.level,
@@ -106,7 +136,13 @@ async def chat_stream(req: ChatRequest):
         try:
             result = run_chat(state, stream_cb=stream_cb)
             result_holder.update(result)
+            log.info(
+                "POST /chat/stream done | finished=%s aborted=%s score=%s",
+                result.get("finished"), result.get("aborted"),
+                result.get("evaluation_score"),
+            )
         except Exception as exc:  # noqa: BLE001
+            log.exception("POST /chat/stream error: %s", exc)
             result_holder["_error"] = str(exc)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel

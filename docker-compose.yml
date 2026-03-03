@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    ports:
+      - "${AGENT_PORT:-8564}:8000"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+    volumes:
+      # Mount source code so --reload picks up changes during development.
+      # Remove this volume block for a fully isolated production container.
+      - .:/app
