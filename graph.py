@@ -193,8 +193,39 @@ def decide_next_step_node(state: InterviewState) -> dict:
     if state.current_round >= state.max_rounds - 1:
         return {"interview_stage": "finished"}
 
-    # ── Abort check: detect a disengaged candidate ────────────────────────────
-    # Collect up to the last 3 answers (history + current answer)
+    # ── Abort check (immediate): single clearly hostile/abusive message ─────────
+    # Runs on every answer regardless of history length.
+    # Only catches obvious, unambiguous hostility — profanity, insults, threats.
+    immediate_abort_prompt = (
+        "You are judging whether a candidate's single reply in a job interview is "
+        "clearly hostile or abusive.\n"
+        f"Candidate's reply: {state.candidate_answer}\n\n"
+        "Respond with ABORT if and only if the reply contains obvious hostility such as:\n"
+        "  - Profanity or sexual language directed at the interviewer\n"
+        "  - Personal insults or threats (e.g. '滚', 'f*** you', '你妈', '操你')\n"
+        "  - Deliberate keyboard-mashing or clearly malicious gibberish\n\n"
+        "Do NOT respond with ABORT for:\n"
+        "  - Saying they don't know or can't answer\n"
+        "  - Asking to skip or move on\n"
+        "  - Short, incomplete, or weak answers\n"
+        "  - Expressing frustration without profanity (e.g. '这题太难了', 'this is unfair')\n\n"
+        "Respond with exactly: ABORT or CONTINUE"
+    )
+    imm_resp = llm.invoke(
+        [{"role": "user", "content": immediate_abort_prompt}],
+        max_tokens=10,
+        temperature=0.0,
+    )
+    imm_text = (
+        imm_resp.content.strip() if hasattr(imm_resp, "content") else str(imm_resp).strip()
+    ).upper()
+    if "ABORT" in imm_text:
+        log.warning("[decide_next_step] immediate ABORT triggered | role=%s round=%d answer=%r",
+                    state.role, state.current_round, (state.candidate_answer or "")[:60])
+        return {"interview_stage": "aborted"}
+
+    # ── Abort check (cumulative): detect sustained disengagement over 3 rounds ─
+    # Needs at least 3 recent answers to avoid false positives on weak-but-genuine replies.
     past_answers = [
         entry["answer"]
         for entry in state.interview_history
@@ -231,7 +262,7 @@ def decide_next_step_node(state: InterviewState) -> dict:
             else str(abort_resp).strip()
         ).upper()
         if "ABORT" in abort_text:
-            log.warning("[decide_next_step] ABORT triggered | role=%s round=%d",
+            log.warning("[decide_next_step] cumulative ABORT triggered | role=%s round=%d",
                         state.role, state.current_round)
             return {"interview_stage": "aborted"}
 
@@ -309,8 +340,11 @@ def generate_followup_node(state: InterviewState, config: RunnableConfig = None)
 def generate_report_node(state: InterviewState, config: RunnableConfig = None) -> dict:
     log.info("[generate_report] role=%s stage=%s rounds_completed=%d",
              state.role, state.interview_stage, state.current_round)
+    # Use the dedicated report callback so report tokens are NOT mixed with
+    # question tokens on the frontend.  Falls back to None (no streaming) if
+    # neither key is provided.
     stream_cb: Optional[Callable[[str], None]] = (
-        config.get("configurable", {}).get("stream_cb") if config else None
+        config.get("configurable", {}).get("report_stream_cb") if config else None
     )
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines = []
@@ -375,18 +409,21 @@ def check_sub_node(state: InterviewState) -> dict:
         f"You asked: {state.current_question}\n"
         f"The candidate replied: {state.candidate_answer}\n\n"
         "Classify the candidate's reply using these strict rules:\n\n"
-        "END — the candidate wants to stop/terminate the whole interview entirely.\n"
-        "  This includes explicit requests to end, quit, or stop the interview itself — "
-        "not just this question.\n"
+        "END — the candidate politely and explicitly wants to stop/terminate the whole interview.\n"
+        "  The intent must be clear, calm, and voluntary — they want to quit the interview process itself.\n"
         "  e.g. '结束面试', '我想结束了', '不想继续面试了', '不想接受面试了',\n"
-        "  'end the interview', 'I want to quit', 'I\'m done with this interview'.\n\n"
+        "  'end the interview', 'I want to quit', 'I\'m done with this interview'.\n"
+        "  IMPORTANT: Do NOT classify as END if the reply contains insults, hostility, profanity,\n"
+        "  or abusive language — those are ANSWER regardless of any surface meaning.\n\n"
         "SUB — the candidate is asking the interviewer something about THIS specific question.\n"
         "  e.g. '能举个例子吗', '你的意思是…?', '这题能再说清楚点吗',\n"
         "  'could you give an example?', 'what do you mean by X?', 'can you rephrase?'\n\n"
         "ANSWER — everything else, including:\n"
         "  - Weak/partial answers or admissions of not knowing\n"
         "  - Requests to skip this one question ('下一题吧', 'pass', '跳过')\n"
-        "  - Giving up on answering this question\n\n"
+        "  - Giving up on answering this question\n"
+        "  - Insults, profanity, hostility, or abusive language directed at the interviewer\n"
+        "    (e.g. '滚', 'f*** you', '垃圾面试', '你真烦', 'go to hell')\n\n"
         "Respond with exactly one word: END, SUB, or ANSWER"
     )
     resp = llm.invoke(
@@ -519,7 +556,11 @@ log.info("LangGraph workflow compiled and ready")
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def run_chat(state: InterviewState, stream_cb: Optional[Callable[[str], None]] = None) -> dict:
+def run_chat(
+    state: InterviewState,
+    stream_cb: Optional[Callable[[str], None]] = None,
+    report_stream_cb: Optional[Callable[[str], None]] = None,
+) -> dict:
     """
     Run the interview graph from the given state.
 
@@ -528,8 +569,14 @@ def run_chat(state: InterviewState, stream_cb: Optional[Callable[[str], None]] =
 
     Returns a unified response dict consumed by the backend.
     If stream_cb is provided, question-generating nodes will call it token-by-token.
+    If report_stream_cb is provided, generate_report_node will call it token-by-token
+    (kept separate so callers can emit a distinct event type and avoid polluting the
+    interview chat bubble with report content).
     """
-    cfg = {"configurable": {"stream_cb": stream_cb}} if stream_cb else None
+    if stream_cb or report_stream_cb:
+        cfg = {"configurable": {"stream_cb": stream_cb, "report_stream_cb": report_stream_cb}}
+    else:
+        cfg = None
     final = graph.invoke(state, config=cfg)
 
     # LangGraph returns a dict for StateGraph; reconstruct the Pydantic model.

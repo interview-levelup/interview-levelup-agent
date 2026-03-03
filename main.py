@@ -125,16 +125,22 @@ async def chat_stream(req: ChatRequest):
         interview_history=[e.model_dump(exclude_none=True) for e in req.interview_history],
     )
 
+    # Queue holds typed tuples (evt_type, token) or None sentinel.
+    # Keeping question tokens ("token") and report tokens ("report_token") separate
+    # lets the backend/frontend ignore report tokens in the chat bubble.
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
     result_holder: dict = {}
 
     def stream_cb(token: str) -> None:
-        loop.call_soon_threadsafe(queue.put_nowait, token)
+        loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
+
+    def report_stream_cb(token: str) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, ("report_token", token))
 
     def run_in_thread() -> None:
         try:
-            result = run_chat(state, stream_cb=stream_cb)
+            result = run_chat(state, stream_cb=stream_cb, report_stream_cb=report_stream_cb)
             result_holder.update(result)
             log.info(
                 "POST /chat/stream done | finished=%s aborted=%s score=%s",
@@ -151,10 +157,11 @@ async def chat_stream(req: ChatRequest):
 
     async def generator():
         while True:
-            token = await queue.get()
-            if token is None:
+            item = await queue.get()
+            if item is None:
                 break
-            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            evt_type, token = item
+            yield f"data: {json.dumps({'type': evt_type, 'content': token})}\n\n"
 
         if "_error" in result_holder:
             yield f"data: {json.dumps({'type': 'error', 'message': result_holder['_error']})}\n\n"

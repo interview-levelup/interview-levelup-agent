@@ -29,34 +29,38 @@ Python microservice that implements the AI interviewer brain. It exposes two Fas
 ## Graph Architecture
 
 ```
-          ┌─────────────┐
-          │ route_entry │  (start / answer path)
-          └──────┬──────┘
-     ┌───────────┴────────────┐
-     ▼                        ▼
-generate_question          check_sub
-     │                        │
-     ▼                        ├── handle_sub → END
-    END               evaluate_answer
-                              │
-                        decide_next_step
-                         ┌────┴─────────────┐
-                         ▼                  ▼
-                  generate_followup   generate_question
-                         │                  │
-                        END               END
-                         (or generate_report → END when finished)
+             ┌─────────────┐
+             │ route_entry │  (start / answer path)
+             └──────┬──────┘
+        ┌───────────┴──────────────┐
+        ▼                          ▼
+generate_question              check_sub
+        │                          │
+       END               ┌─────────┼──────────┐
+                         ▼         ▼           ▼
+                     handle_sub  (user_end) evaluate_answer
+                         │           │          │
+                        END          │    decide_next_step
+                                     │     ┌────┼────┬──────────┐
+                                     │     ▼    ▼    ▼          ▼
+                                     │  (next) (fu) (finished) (aborted)
+                                     │    │     │       │          │
+                                     │    ▼     ▼       └────┬─────┘
+                                     │ gen_q  gen_fu         ▼
+                                     │   │      │       generate_report
+                                     │  END    END            │
+                                     └───────────────────────END
 ```
 
 | Node | Responsibility |
 |---|---|
 | `generate_question` | Produce the next interview question (avoids repeating covered topics) |
-| `check_sub` | Detect whether the candidate's answer is itself a question directed at the interviewer |
-| `handle_sub` | Answer the candidate's sub-question and return turn to them |
+| `check_sub` | Classify reply as: sub-question (SUB), voluntary exit (END), or answer (ANSWER) |
+| `handle_sub` | Answer the candidate's sub-question and return the turn to them |
 | `evaluate_answer` | Score the answer 0–100, produce evaluation detail |
-| `decide_next_step` | Route to follow-up, next question, final report, or abort |
+| `decide_next_step` | Two-layer abort check (immediate hostile + cumulative), then route to follow-up / next question / report |
 | `generate_followup` | Ask a targeted follow-up for a weak answer |
-| `generate_report` | Produce the final structured debrief |
+| `generate_report` | Produce the final structured debrief (triggered by: all rounds done, user exit, or abort) |
 
 ## Endpoints
 
